@@ -26,7 +26,14 @@ POLYMARKETSCAN_API_URL = "https://gzydspfquuaudqeztorw.supabase.co/functions/v1/
 
 # Гаманці китів для відстеження (встав сюди реальні адреси)
 WHALE_WALLETS = [
-    "0x1234567890123456789012345678901234567890"
+    "0x492442eab586f242b53bda933fd5de859c8a3782",
+    "0xf6d91fbbefacade7d5908eb13e16acf1efeb305e",
+    "0x2a2c53bd278c04da9962fcf96490e17f3dfb9bc1",
+    "0x0b9cae2b0dfe7a71c413e0604eaac1c352f87e44",
+    "0x07b8e44b90cc3e91b8d5fe60ea810d2534638e25",
+    "0x72b40c0012682ef52228ad53ef955f9e4f177d67",
+    "0x86cd93526a4e7ad201ed3d1c6f2647b61837504c",
+    "0x78ad03d27582cd1b5255d364ff8f093b6cf745cc"
 ]
 
 # Завантажуємо змінні середовища
