@@ -3,3 +3,4 @@ requests>=2.31.0
 websockets>=11.0.3
 python-dotenv>=1.0.0
 google-genai
+asyncpg>=0.29.0

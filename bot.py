@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import requests
+import asyncpg
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
@@ -29,6 +30,37 @@ load_dotenv()
 
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Ініціалізація пулу бази даних
+db_pool = None
+
+async def init_db():
+    global db_pool
+    if not DATABASE_URL:
+        logger.info("DATABASE_URL не знайдено, пропускаємо ініціалізацію БД.")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id SERIAL PRIMARY KEY,
+                    market_slug VARCHAR(255),
+                    market_id VARCHAR(255),
+                    side VARCHAR(10),
+                    execution_price FLOAT,
+                    amount_usd FLOAT,
+                    fair_value FLOAT,
+                    confidence INT,
+                    reason TEXT,
+                    is_simulation BOOLEAN,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+        logger.info("✅ База даних PostgreSQL успішно ініціалізована (таблиця trades).")
+    except Exception as e:
+        logger.error(f"❌ Помилка підключення до БД: {e}")
 
 # Ініціалізація клієнта Gemini
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -214,6 +246,20 @@ async def execute_trade(opportunity: Dict[str, Any], ai_decision: Dict[str, Any]
     except Exception as e:
         logger.error(f"[ERROR] Помилка виконання Live-угоди: {e}")
 
+    # Після успішного (або симульованого) виконання - запишемо в PostgreSQL (якщо доступно)
+    if db_pool:
+        try:
+            # Для симуляції ціна виконання = market_price, для лайву = max_price
+            exec_price = market_price if SIMULATION_MODE else max_price
+            async with db_pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO trades 
+                    (market_slug, market_id, side, execution_price, amount_usd, fair_value, confidence, reason, is_simulation)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ''', market_slug, market_id, side, exec_price, amount_usd, fair_value, ai_decision.get("confidence", 0), ai_decision.get("reason", ""), SIMULATION_MODE)
+        except Exception as db_e:
+            logger.error(f"Помилка запису в БД: {db_e}")
+
 async def check_arena_portfolio():
     """Перевіряємо поточний баланс Агента в Арені."""
     if SIMULATION_MODE:
@@ -230,6 +276,8 @@ async def main_loop():
     logger.info("=== Запуск Polymarket AI Bot (MoneyPigBot) ===")
     logger.info(f"Режим: {'SIMULATION (Arena)' if SIMULATION_MODE else 'LIVE TRADING'}")
     logger.info(f"Баланс на ставку: ${TRADE_AMOUNT_USD}")
+    
+    await init_db()
     
     processed_slugs = set()
 
