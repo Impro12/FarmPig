@@ -1,10 +1,10 @@
 import os
-import time
 import json
 import asyncio
 import logging
 import requests
 import asyncpg
+import websockets
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
@@ -21,9 +21,13 @@ logger = logging.getLogger(__name__)
 SIMULATION_MODE = True  # True = Paper Trading на Agent Arena, False = Реальні угоди
 TRADE_AMOUNT_USD = 2.5   # $2-$3 як вимагається для банку $100
 MAX_SLIPPAGE_PCT = 0.03  # 3% максимальне прослизання
-CHECK_INTERVAL_SEC = 60  # Інтервал перевірки Арени
 AGENT_ID = "MoneyPigBot"
 POLYMARKETSCAN_API_URL = "https://gzydspfquuaudqeztorw.supabase.co/functions/v1/agent-api"
+
+# Гаманці китів для відстеження (встав сюди реальні адреси)
+WHALE_WALLETS = [
+    "0x1234567890123456789012345678901234567890"
+]
 
 # Завантажуємо змінні середовища
 load_dotenv()
@@ -31,6 +35,7 @@ load_dotenv()
 PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+QUICKNODE_WSS_URL = os.getenv("QUICKNODE_WSS_URL")
 
 # Ініціалізація пулу бази даних
 db_pool = None
@@ -272,56 +277,93 @@ async def check_arena_portfolio():
         except:
              pass
 
+async def listen_to_whales_ws():
+    """Слухає QuickNode WebSockets для швидкої реакції на події китів (без поллінгу)."""
+    if not QUICKNODE_WSS_URL or not QUICKNODE_WSS_URL.startswith("wss://"):
+        logger.error("QUICKNODE_WSS_URL не налаштований. WebSocket трекер вимкнено.")
+        return
+
+    logger.info(f"🔗 Підключення до QuickNode WebSocket...")
+    
+    # Форматуємо гаманці для Topics (ERC1155 TransferSingle `to` або `from` fields, доповнені до 32 байт)
+    # Зверніть увагу: це базовий приклад. У реальному житті краще фільтрувати всі логи Polymarket Exchange
+    # або парсити pending transactions (mempool).
+    whale_topics = ["0x000000000000000000000000" + w[2:].lower() for w in WHALE_WALLETS]
+    
+    subscription_payload = {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "method": "eth_subscribe",
+        "params": [
+            "logs",
+            {
+                # Трансфери на Polymarket Exchange / CTF contract
+                # Якщо залишити пустим, слухатиме весь блокчейн за участю цих топіків (гаманців)
+                "topics": [None, None, whale_topics] # Фільтр: гаманець є 'to' (Topic 2 у TransferSingle)
+            }
+        ]
+    }
+
+    while True:
+        try:
+            async with websockets.connect(QUICKNODE_WSS_URL) as ws:
+                await ws.send(json.dumps(subscription_payload))
+                response = await ws.recv()
+                logger.info(f"✅ Успішна підписка на події китів! ID: {json.loads(response).get('result')}")
+
+                while True:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    
+                    if "params" in data and "result" in data["params"]:
+                        log_data = data["params"]["result"]
+                        tx_hash = log_data.get("transactionHash")
+                        logger.info(f"🐋 Виявлено активність кита! Tx: {tx_hash}")
+                        
+                        # Коли трапилась подія — обробляємо її (отримуємо ринок, перевіряємо AI тощо)
+                        # Для демо ми запускаємо fetch_opportunities як реакцію на подію, а не по таймеру
+                        asyncio.create_task(process_opportunities_on_event())
+                        
+        except Exception as e:
+            logger.error(f"WebSocket відключився ({e}). Реконект через 5 сек...")
+            await asyncio.sleep(5)
+
+async def process_opportunities_on_event():
+    """Викликається коли WebSocket фіксує рух. Аналізує ринки і приймає рішення."""
+    try:
+        opps = await fetch_opportunities()
+        for opp in opps:
+            title = opp.get("title", "Unknown")
+            pm_price = float(opp.get("polymarketPrice", 0))
+            ai_price = float(opp.get("aiConsensus", 0))
+            direction = opp.get("divergenceDirection", "unknown")
+            
+            logger.info(f"💡 Знайдено оппортьюніті після активності: '{title}' | Поточна: {pm_price} | AI: {ai_price} ({direction})")
+            
+            ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
+            confidence = ai_decision.get("confidence", 0)
+            should_trade = ai_decision.get("trade", False)
+            
+            if should_trade and confidence >= 70:
+                logger.info("🚀 Угода підтверджена! Виконання...")
+                await execute_trade(opp, ai_decision, TRADE_AMOUNT_USD)
+            else:
+                logger.info("⛔ Відхилено ШІ.")
+                
+    except Exception as e:
+        logger.error(f"Помилка під час обробки події: {e}")
+
 async def main_loop():
     logger.info("=== Запуск Polymarket AI Bot (MoneyPigBot) ===")
     logger.info(f"Режим: {'SIMULATION (Arena)' if SIMULATION_MODE else 'LIVE TRADING'}")
     logger.info(f"Баланс на ставку: ${TRADE_AMOUNT_USD}")
     
     await init_db()
+    await check_arena_portfolio()
     
-    processed_slugs = set()
-
-    while True:
-        try:
-            await check_arena_portfolio()
-            logger.info("📡 Шукаємо нові можливості AI vs Humans...")
-            
-            opps = await fetch_opportunities()
-            
-            for opp in opps:
-                slug = opp.get("slug")
-                if slug in processed_slugs:
-                    continue 
-                    
-                processed_slugs.add(slug)
-                
-                title = opp.get("title", "Unknown")
-                pm_price = float(opp.get("polymarketPrice", 0))
-                ai_price = float(opp.get("aiConsensus", 0))
-                direction = opp.get("divergenceDirection", "unknown")
-                
-                logger.info(f"💡 Знайдено сигнал: '{title}' | Polymarket ціна: {pm_price} | AI: {ai_price} ({direction})")
-                
-                # Запускаємо власний Gemini Filter
-                ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
-                
-                confidence = ai_decision.get("confidence", 0)
-                should_trade = ai_decision.get("trade", False)
-                reason = ai_decision.get("reason", "Не вказано")
-                
-                logger.info(f"🤖 Gemini Аналіз: Confidence: {confidence}%, Trade: {should_trade}. Reason: {reason}")
-                
-                if should_trade and confidence >= 70:
-                    logger.info("🚀 Угода підтверджена! Виконання...")
-                    await execute_trade(opp, ai_decision, TRADE_AMOUNT_USD)
-                else:
-                    logger.info("⛔ Угоду відхилено ризик-менеджером Gemini.")
-                    
-        except Exception as e:
-            logger.error(f"Непередбачена помилка в основному циклі: {e}")
-            
-        logger.info(f"Очікування {CHECK_INTERVAL_SEC} секунд...")
-        await asyncio.sleep(CHECK_INTERVAL_SEC)
+    logger.info("📡 Запуск WebSocket слухача...")
+    # Запускаємо WebSockets listener замість while True з sleep(60)
+    await listen_to_whales_ws()
 
 if __name__ == "__main__":
     try:
