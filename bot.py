@@ -437,7 +437,17 @@ async def process_opportunities_on_event(source="WHALE"):
             ai_price = float(opp.get("aiConsensus", 0))
             direction = opp.get("divergenceDirection", "unknown")
             
+            # --- ОПТИМІЗАЦІЯ КВОТИ ---
+            # Якщо розбіжність занадто мала (< 3%), ми навіть не питаємо ШІ, щоб економити ліміти API.
+            edge = abs(pm_price - ai_price)
+            if edge < 0.03:
+                logger.info(f"⏭️ [{source}] Скіп: '{title}' (Замалий Edge: {edge*100:.1f}%)")
+                continue
+                
             logger.info(f"💡 [{source}] Знайдено оппортьюніті: '{title}' | PM: {pm_price} | AI: {ai_price} ({direction})")
+            
+            # Невелика пауза між запитами до ШІ, щоб не тригерити 429 по RPM (Requests Per Minute)
+            await asyncio.sleep(2)
             
             ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
             confidence = ai_decision.get("confidence", 0)
@@ -475,15 +485,16 @@ async def process_opportunities_on_event(source="WHALE"):
         logger.error(f"Помилка під час обробки події: {e}")
 
 async def run_autonomous_scanner():
-    """Фонова задача, яка перевіряє арбітражні можливості самостійно кожні 5 хвилин."""
-    logger.info(f"⏳ Автономний сканер запущено. Інтервал: 300 сек.")
+    """Фонова задача, яка перевіряє арбітражні можливості самостійно кожні 15 хвилин."""
+    # Інтервал 900 сек (15 хв) замість 300 сек, щоб не перевищити ліміт Gemini Free Tier (1500 RPD)
+    logger.info(f"⏳ Автономний сканер запущено. Інтервал: 900 сек.")
     while True:
         try:
             logger.info("🔍 [Сканер] Шукаю нові арбітражні ситуації...")
             await process_opportunities_on_event(source="SCANNER")
         except Exception as e:
             logger.error(f"Помилка в автономному сканері: {e}")
-        await asyncio.sleep(300)
+        await asyncio.sleep(900)
 
 async def main_loop():
     logger.info("=== Запуск Polymarket AI Bot (MoneyPigBot) ===")
