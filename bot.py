@@ -24,17 +24,10 @@ MAX_SLIPPAGE_PCT = 0.03  # 3% максимальне прослизання
 AGENT_ID = "MoneyPigBot"
 POLYMARKETSCAN_API_URL = "https://gzydspfquuaudqeztorw.supabase.co/functions/v1/agent-api"
 
-# Гаманці китів для відстеження (встав сюди реальні адреси)
-WHALE_WALLETS = [
-    "0x492442eab586f242b53bda933fd5de859c8a3782",
-    "0xf6d91fbbefacade7d5908eb13e16acf1efeb305e",
-    "0x2a2c53bd278c04da9962fcf96490e17f3dfb9bc1",
-    "0x0b9cae2b0dfe7a71c413e0604eaac1c352f87e44",
-    "0x07b8e44b90cc3e91b8d5fe60ea810d2534638e25",
-    "0x72b40c0012682ef52228ad53ef955f9e4f177d67",
-    "0x86cd93526a4e7ad201ed3d1c6f2647b61837504c",
-    "0x78ad03d27582cd1b5255d364ff8f093b6cf745cc"
-]
+# Гаманці китів для відстеження (буде оновлюватися динамічно)
+WHALE_WALLETS = set()
+WHALE_DISCOVERY_THRESHOLD_USD = 10000  # Фікс: мінімальний розмыр транзакції щоб вважати китом, можна збільшувати
+CTF_EXCHANGE_ADDRESS = "0x4bFB41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Контракт Polymarket CTF
 
 # Завантажуємо змінні середовища
 load_dotenv()
@@ -284,6 +277,25 @@ async def check_arena_portfolio():
         except:
              pass
 
+async def fetch_initial_whales():
+    """Завантажує початковий список китів з API на старті бота"""
+    try:
+        url = f"{POLYMARKETSCAN_API_URL}?action=whales&limit=20"
+        logger.info(f"Завантаження початкових китів з: {url}")
+        
+        # Асинхронно робимо HTTP запит
+        response = await asyncio.to_thread(requests.get, url, timeout=10)
+        data = response.json().get("data", [])
+        
+        for w in data:
+            wallet = w.get("wallet")
+            if wallet:
+                WHALE_WALLETS.add(wallet.lower())
+                
+        logger.info(f"🐳 Успішно завантажено {len(WHALE_WALLETS)} китів для відстеження.")
+    except Exception as e:
+        logger.error(f"Помилка завантаження первинних китів: {e}")
+
 async def listen_to_whales_ws():
     """Слухає QuickNode WebSockets для швидкої реакції на події китів (без поллінгу)."""
     if not QUICKNODE_WSS_URL or not QUICKNODE_WSS_URL.startswith("wss://"):
@@ -292,10 +304,10 @@ async def listen_to_whales_ws():
 
     logger.info(f"🔗 Підключення до QuickNode WebSocket...")
     
-    # Форматуємо гаманці для Topics (ERC1155 TransferSingle `to` або `from` fields, доповнені до 32 байт)
-    # Зверніть увагу: це базовий приклад. У реальному житті краще фільтрувати всі логи Polymarket Exchange
-    # або парсити pending transactions (mempool).
-    whale_topics = ["0x000000000000000000000000" + w[2:].lower() for w in WHALE_WALLETS]
+    # Підписуємось на TransferSingle (Erc1155) події контракту Polymarket
+    # topic0 для `TransferSingle(address operator, address from, address to, uint256 id, uint256 value)`
+    # Це: 0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62
+    transfer_single_topic = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
     
     subscription_payload = {
         "id": 1,
@@ -304,9 +316,8 @@ async def listen_to_whales_ws():
         "params": [
             "logs",
             {
-                # Трансфери на Polymarket Exchange / CTF contract
-                # Якщо залишити пустим, слухатиме весь блокчейн за участю цих топіків (гаманців)
-                "topics": [None, None, whale_topics] # Фільтр: гаманець є 'to' (Topic 2 у TransferSingle)
+                "address": CTF_EXCHANGE_ADDRESS, # Тільки логи з головного контракту Polymarket
+                "topics": [transfer_single_topic] 
             }
         ]
     }
@@ -316,7 +327,7 @@ async def listen_to_whales_ws():
             async with websockets.connect(QUICKNODE_WSS_URL) as ws:
                 await ws.send(json.dumps(subscription_payload))
                 response = await ws.recv()
-                logger.info(f"✅ Успішна підписка на події китів! ID: {json.loads(response).get('result')}")
+                logger.info(f"✅ Успішна підписка на CTF Exchange! Шукаю китів та їхні рухи... ID: {json.loads(response).get('result')}")
 
                 while True:
                     msg = await ws.recv()
@@ -324,13 +335,37 @@ async def listen_to_whales_ws():
                     
                     if "params" in data and "result" in data["params"]:
                         log_data = data["params"]["result"]
-                        tx_hash = log_data.get("transactionHash")
-                        logger.info(f"🐋 Виявлено активність кита! Tx: {tx_hash}")
+                        topics = log_data.get("topics", [])
                         
-                        # Коли трапилась подія — обробляємо її (отримуємо ринок, перевіряємо AI тощо)
-                        # Для демо ми запускаємо fetch_opportunities як реакцію на подію, а не по таймеру
-                        asyncio.create_task(process_opportunities_on_event())
-                        
+                        if len(topics) >= 4:
+                            # Парсимо TransferSingle: operator, from, to знаходяться в topics[1], topics[2], topics[3] відповідно
+                            # Адреса покупця ("to")
+                            to_address = "0x" + topics[3][26:].lower()
+                            tx_hash = log_data.get("transactionHash")
+                            
+                            # Перевіряємо, чи ми знаємо цього гаманця
+                            if to_address in WHALE_WALLETS:
+                                logger.info(f"🐋 Знайомий Кит діє! Tx: {tx_hash} | {to_address}")
+                                asyncio.create_task(process_opportunities_on_event())
+                            else:
+                                # Data містить [id, value] без індексів (розділено на 2 юінти по 32 байти)
+                                unindexed_data = log_data.get("data", "0x")[2:]
+                                if len(unindexed_data) >= 128:
+                                    value_hex = unindexed_data[64:128] # Друга частина
+                                    try:
+                                        value_int = int(value_hex, 16)
+                                        # Тут дуже спрощено: value_int / 1e6 (якщо це USDC shares). 
+                                        usd_estimate = value_int / 10**6 
+                                        
+                                        if usd_estimate >= WHALE_DISCOVERY_THRESHOLD_USD:
+                                            logger.info(f"🚨🚨 НОВИЙ КИТ ВИЯВЛЕНИЙ! 🚨🚨")
+                                            logger.info(f"Гаманець: {to_address} | Об'єм: ~${usd_estimate:,.2f} | Tx: {tx_hash}")
+                                            WHALE_WALLETS.add(to_address)
+                                            # Ми знайшли нового кита, значить він щойно купив, давайте аналізувати
+                                            asyncio.create_task(process_opportunities_on_event())
+                                    except Exception as parse_e:
+                                        pass
+                                
         except Exception as e:
             logger.error(f"WebSocket відключився ({e}). Реконект через 5 сек...")
             await asyncio.sleep(5)
@@ -367,6 +402,7 @@ async def main_loop():
     
     await init_db()
     await check_arena_portfolio()
+    await fetch_initial_whales()
     
     logger.info("📡 Запуск WebSocket слухача...")
     # Запускаємо WebSockets listener замість while True з sleep(60)
