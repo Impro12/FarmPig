@@ -28,6 +28,7 @@ POLYMARKETSCAN_API_URL = "https://gzydspfquuaudqeztorw.supabase.co/functions/v1/
 
 # Гаманці китів для відстеження (буде оновлюватися динамічно)
 WHALE_WALLETS = set()
+PROCESSED_SLUGS = set() # Зберігаємо slug ринків, де ми вже відторгували
 WHALE_DISCOVERY_THRESHOLD_USD = 10000  # Фікс: мінімальний розмыр транзакції щоб вважати китом, можна збільшувати
 CTF_EXCHANGE_ADDRESS = "0x4bFB41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Контракт Polymarket CTF
 
@@ -38,6 +39,8 @@ PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 QUICKNODE_WSS_URL = os.getenv("QUICKNODE_WSS_URL")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Ініціалізація пулу бази даних
 db_pool = None
@@ -91,6 +94,17 @@ def init_clob_client() -> Optional[ClobClient]:
         return None
 
 clob_client = init_clob_client() if not SIMULATION_MODE else None
+
+async def send_telegram_message(text: str):
+    """Надсилає повідомлення у Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        await asyncio.to_thread(requests.post, url, json=payload, timeout=5)
+    except Exception as e:
+        logger.error(f"Помилка відправки в Telegram: {e}")
 
 async def fetch_opportunities() -> List[Dict[str, Any]]:
     """
@@ -146,7 +160,7 @@ async def validate_trade_with_ai(market_title: str, current_price: float, ai_con
 
     try:
         response = await gemini_client.aio.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.0-flash",
             contents=user_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -335,10 +349,9 @@ async def fetch_initial_whales():
 async def listen_to_whales_ws():
     """Слухає QuickNode WebSockets для швидкої реакції на події китів (без поллінгу)."""
     if not QUICKNODE_WSS_URL or not QUICKNODE_WSS_URL.startswith("wss://"):
-        logger.error("QUICKNODE_WSS_URL не налаштований. Перехід у резервний режим (опитування раз на хвилину).")
+        logger.error("QUICKNODE_WSS_URL не налаштований. WebSocket трекер вимкнено. Працюватиме лише Автономний сканер.")
         while True:
-            await process_opportunities_on_event()
-            await asyncio.sleep(60)
+            await asyncio.sleep(3600)
         return
 
     logger.info(f"🔗 Підключення до QuickNode WebSocket...")
@@ -400,6 +413,7 @@ async def listen_to_whales_ws():
                                             logger.info(f"🚨🚨 НОВИЙ КИТ ВИЯВЛЕНИЙ! 🚨🚨")
                                             logger.info(f"Гаманець: {to_address} | Об'єм: ~${usd_estimate:,.2f} | Tx: {tx_hash}")
                                             WHALE_WALLETS.add(to_address)
+                                            await send_telegram_message(f"🚨 <b>НОВИЙ КИТ ВИЯВЛЕНИЙ!</b> 🚨\nГаманець: <code>{to_address}</code>\nОб'єм угоди: <b>~${usd_estimate:,.2f}</b>\nTx: <code>{tx_hash}</code>")
                                             # Ми знайшли нового кита, значить він щойно купив, давайте аналізувати
                                             asyncio.create_task(process_opportunities_on_event())
                                     except Exception as parse_e:
@@ -409,17 +423,21 @@ async def listen_to_whales_ws():
             logger.error(f"WebSocket відключився ({e}). Реконект через 5 сек...")
             await asyncio.sleep(5)
 
-async def process_opportunities_on_event():
-    """Викликається коли WebSocket фіксує рух. Аналізує ринки і приймає рішення."""
+async def process_opportunities_on_event(source="WHALE"):
+    """Викликається коли WebSocket фіксує рух або по таймеру. Аналізує ринки і приймає рішення."""
     try:
         opps = await fetch_opportunities()
         for opp in opps:
+            slug = opp.get("slug")
+            if not slug or slug in PROCESSED_SLUGS:
+                continue
+
             title = opp.get("title", "Unknown")
             pm_price = float(opp.get("polymarketPrice", 0))
             ai_price = float(opp.get("aiConsensus", 0))
             direction = opp.get("divergenceDirection", "unknown")
             
-            logger.info(f"💡 Знайдено оппортьюніті після активності: '{title}' | Поточна: {pm_price} | AI: {ai_price} ({direction})")
+            logger.info(f"💡 [{source}] Знайдено оппортьюніті: '{title}' | PM: {pm_price} | AI: {ai_price} ({direction})")
             
             ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
             confidence = ai_decision.get("confidence", 0)
@@ -435,7 +453,19 @@ async def process_opportunities_on_event():
                 
                 if optimal_bet >= 1.0: # Polymarket mini bet size roughly ~$1
                     logger.info("🚀 Розмір ставки валідний. Виконання...")
+                    
+                    # Відправка в Telegram
+                    mode_str = "🎮 ARENA" if SIMULATION_MODE else "🔴 LIVE"
+                    msg = (f"🚀 <b>MoneyPigBot торгує! [{mode_str}] ({source})</b>\n\n"
+                           f"<b>Ринок:</b> {title}\n"
+                           f"<b>Рішення:</b> {direction.upper()}\n"
+                           f"<b>Ціна:</b> ${pm_price}\n"
+                           f"<b>Впевненість ШІ:</b> {confidence}%\n"
+                           f"<b>Ставка (Quarter-Kelly):</b> ${optimal_bet}")
+                    await send_telegram_message(msg)
+                    
                     await execute_trade(opp, ai_decision, optimal_bet)
+                    PROCESSED_SLUGS.add(slug)
                 else:
                     logger.info("⛔ Ставка занадто мала, пропускаємо (Kelly < $1.0) або немає математичної переваги.")
             else:
@@ -443,6 +473,17 @@ async def process_opportunities_on_event():
                 
     except Exception as e:
         logger.error(f"Помилка під час обробки події: {e}")
+
+async def run_autonomous_scanner():
+    """Фонова задача, яка перевіряє арбітражні можливості самостійно кожні 5 хвилин."""
+    logger.info(f"⏳ Автономний сканер запущено. Інтервал: 300 сек.")
+    while True:
+        try:
+            logger.info("🔍 [Сканер] Шукаю нові арбітражні ситуації...")
+            await process_opportunities_on_event(source="SCANNER")
+        except Exception as e:
+            logger.error(f"Помилка в автономному сканері: {e}")
+        await asyncio.sleep(300)
 
 async def main_loop():
     logger.info("=== Запуск Polymarket AI Bot (MoneyPigBot) ===")
@@ -452,8 +493,12 @@ async def main_loop():
     await check_arena_portfolio()
     await fetch_initial_whales()
     
-    logger.info("📡 Запуск WebSocket слухача...")
-    # Запускаємо WebSockets listener замість while True з sleep(60)
+    logger.info("📡 Запуск WebSocket слухача та Автономного сканера...")
+    
+    # Запускаємо автономний сканер як фонову задачу
+    asyncio.create_task(run_autonomous_scanner())
+    
+    # Запускаємо WebSockets listener (він блокує виконання)
     await listen_to_whales_ws()
 
 if __name__ == "__main__":
