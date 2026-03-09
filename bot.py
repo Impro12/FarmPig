@@ -42,6 +42,13 @@ QUICKNODE_WSS_URL = os.getenv("QUICKNODE_WSS_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Обмежувач швидкості (Rate Limiter) - 5 запитів на ХВИЛИНУ
+# 60 сек / 5 = 12 секунд між запитами
+async def rate_limited_ai_call():
+    """Забезпечує паузу 12 секунд для дотримання ліміту 5 RPM"""
+    logger.info("⏳ Очікування 12с для дотримання ліміту 5 RPM...")
+    await asyncio.sleep(12) 
+
 # Ініціалізація пулу бази даних
 db_pool = None
 
@@ -460,8 +467,8 @@ async def process_opportunities_on_event(source="WHALE"):
                 
             logger.info(f"💡 [{source}] Знайдено оппортьюніті: '{title}' | PM: {pm_price} | AI: {ai_price} ({direction})")
             
-            # Невелика пауза між запитами до ШІ, щоб не тригерити 429 по RPM (Requests Per Minute)
-            await asyncio.sleep(2)
+            # Використовуємо обмежувач 5 RPM (12s)
+            await rate_limited_ai_call()
             
             ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
             confidence = ai_decision.get("confidence", 0)
