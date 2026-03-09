@@ -72,6 +72,20 @@ async def init_db():
     except Exception as e:
         logger.error(f"❌ Помилка підключення до БД: {e}")
 
+async def load_processed_slugs():
+    """Завантажує вже відпрацьовані ринки з бази даних, щоб не дублювати угоди після перезапуску."""
+    global PROCESSED_SLUGS
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT DISTINCT market_slug FROM trades")
+            for row in rows:
+                PROCESSED_SLUGS.add(row['market_slug'])
+        logger.info(f"📁 Завантажено {len(PROCESSED_SLUGS)} відпрацьованих ринків з БД.")
+    except Exception as e:
+        logger.error(f"Помилка завантаження processed_slugs: {e}")
+
 # Ініціалізація клієнта Gemini
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
@@ -501,6 +515,7 @@ async def main_loop():
     logger.info(f"Режим: {'SIMULATION (Arena)' if SIMULATION_MODE else 'LIVE TRADING'}")
     
     await init_db()
+    await load_processed_slugs()
     await check_arena_portfolio()
     await fetch_initial_whales()
     
