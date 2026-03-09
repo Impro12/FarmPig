@@ -186,7 +186,7 @@ async def validate_trade_with_ai(market_title: str, current_price: float, ai_con
 
     try:
         response = await gemini_client.aio.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=user_prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
