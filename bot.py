@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 
 # --- ВАЖЛИВІ НАЛАШТУВАННЯ ---
 SIMULATION_MODE = True  # True = Paper Trading на Agent Arena, False = Реальні угоди
-TRADE_AMOUNT_USD = 2.5   # $2-$3 як вимагається для банку $100
+TOTAL_BANKROLL_USD = 100.0   # Твій загальний банк для реальних угод (в USD)
 MAX_SLIPPAGE_PCT = 0.03  # 3% максимальне прослизання
+KELLY_MULTIPLIER = 0.25  # Quarter-Kelly (консервативний підхід)
+MAX_BET_PERCENTAGE = 0.05 # Ніколи не ставити більше 5% від банку (Ризик-менеджмент)
 AGENT_ID = "MoneyPigBot"
 POLYMARKETSCAN_API_URL = "https://gzydspfquuaudqeztorw.supabase.co/functions/v1/agent-api"
 
@@ -169,6 +171,34 @@ async def validate_trade_with_ai(market_title: str, current_price: float, ai_con
         
     return {"confidence": 0, "trade": False, "reason": "System Error", "fair_value": ai_consensus}
 
+def calculate_optimal_bet(fair_value: float, current_price: float, current_bankroll: float) -> float:
+    """Обчислює розмір ставки за адаптованим критерієм Келлі (Quarter-Kelly)"""
+    if current_bankroll <= 0:
+        return 0.0
+        
+    edge = fair_value - current_price
+    
+    # Якщо переваги (edge) немає або вона від'ємна — не торгуємо взагалі
+    if edge <= 0:
+        return 0.0
+        
+    # Формула Келлі для бінарних опціонів: f* = (P - C) / (1 - C)
+    # Де C - поточна ціна (ямости ставки), P - наша впевненість.
+    # Так як тут "ставка" = 1, прибуток = 1 - C
+    if current_price >= 1.0: return 0.0 # Захист від ділення на 0
+    
+    kelly_fraction = edge / (1.0 - current_price)
+    
+    # Регулювання ризику (Quarter Kelly)
+    adj_kelly_fraction = kelly_fraction * KELLY_MULTIPLIER
+    
+    # Обмеження максимуму
+    safest_fraction = min(adj_kelly_fraction, MAX_BET_PERCENTAGE)
+    if safest_fraction <= 0: return 0.0
+    
+    bet_amount = current_bankroll * safest_fraction
+    return round(bet_amount, 2)
+
 async def execute_trade(opportunity: Dict[str, Any], ai_decision: Dict[str, Any], amount_usd: float):
     """
     Реєструє угоду.
@@ -265,15 +295,21 @@ async def execute_trade(opportunity: Dict[str, Any], ai_decision: Dict[str, Any]
         except Exception as db_e:
             logger.error(f"Помилка запису в БД: {db_e}")
 
+# Глобальна змінна для віртуального балансу Арени
+current_arena_portfolio_value = 1000.0
+
 async def check_arena_portfolio():
     """Перевіряємо поточний баланс Агента в Арені."""
+    global current_arena_portfolio_value
     if SIMULATION_MODE:
         try:
             url = f"{POLYMARKETSCAN_API_URL}?action=my_portfolio&agent_id={AGENT_ID}"
             response = await asyncio.to_thread(requests.get, url, timeout=10)
             data = response.json().get("data", {})
             value = data.get("portfolio_value", 0)
-            logger.info(f"📊 Поточний Portfolio Value в Arena: ${value}")
+            if value > 0:
+                current_arena_portfolio_value = value
+            logger.info(f"📊 Поточний Portfolio Value в Arena: ${current_arena_portfolio_value}")
         except:
              pass
 
@@ -299,7 +335,10 @@ async def fetch_initial_whales():
 async def listen_to_whales_ws():
     """Слухає QuickNode WebSockets для швидкої реакції на події китів (без поллінгу)."""
     if not QUICKNODE_WSS_URL or not QUICKNODE_WSS_URL.startswith("wss://"):
-        logger.error("QUICKNODE_WSS_URL не налаштований. WebSocket трекер вимкнено.")
+        logger.error("QUICKNODE_WSS_URL не налаштований. Перехід у резервний режим (опитування раз на хвилину).")
+        while True:
+            await process_opportunities_on_event()
+            await asyncio.sleep(60)
         return
 
     logger.info(f"🔗 Підключення до QuickNode WebSocket...")
@@ -385,10 +424,20 @@ async def process_opportunities_on_event():
             ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
             confidence = ai_decision.get("confidence", 0)
             should_trade = ai_decision.get("trade", False)
+            fair_value = ai_decision.get("fair_value", ai_price)
             
             if should_trade and confidence >= 70:
-                logger.info("🚀 Угода підтверджена! Виконання...")
-                await execute_trade(opp, ai_decision, TRADE_AMOUNT_USD)
+                # Дані для сайзунга
+                bankroll = current_arena_portfolio_value if SIMULATION_MODE else TOTAL_BANKROLL_USD
+                optimal_bet = calculate_optimal_bet(fair_value, pm_price, bankroll)
+                
+                logger.info(f"📐 Розрахований Kelly Size: ${optimal_bet} (з банку ${bankroll})")
+                
+                if optimal_bet >= 1.0: # Polymarket mini bet size roughly ~$1
+                    logger.info("🚀 Розмір ставки валідний. Виконання...")
+                    await execute_trade(opp, ai_decision, optimal_bet)
+                else:
+                    logger.info("⛔ Ставка занадто мала, пропускаємо (Kelly < $1.0) або немає математичної переваги.")
             else:
                 logger.info("⛔ Відхилено ШІ.")
                 
@@ -398,7 +447,6 @@ async def process_opportunities_on_event():
 async def main_loop():
     logger.info("=== Запуск Polymarket AI Bot (MoneyPigBot) ===")
     logger.info(f"Режим: {'SIMULATION (Arena)' if SIMULATION_MODE else 'LIVE TRADING'}")
-    logger.info(f"Баланс на ставку: ${TRADE_AMOUNT_USD}")
     
     await init_db()
     await check_arena_portfolio()
