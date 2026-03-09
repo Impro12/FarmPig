@@ -32,6 +32,11 @@ PROCESSED_SLUGS = set() # Зберігаємо slug ринків, де ми вж
 WHALE_DISCOVERY_THRESHOLD_USD = 10000  # Фікс: мінімальний розмыр транзакції щоб вважати китом, можна збільшувати
 CTF_EXCHANGE_ADDRESS = "0x4bFB41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Контракт Polymarket CTF
 
+# Кеш рішень ШІ (щоб не питати Gemini про той самий ринок занадто часто)
+# Формат: {slug: {"decision": dict, "timestamp": float}}
+AI_DECISION_CACHE = {}
+AI_CACHE_TTL = 3600  # 1 година (в секундах)
+
 # Завантажуємо змінні середовища
 load_dotenv()
 
@@ -467,10 +472,24 @@ async def process_opportunities_on_event(source="WHALE"):
                 
             logger.info(f"💡 [{source}] Знайдено оппортьюніті: '{title}' | PM: {pm_price} | AI: {ai_price} ({direction})")
             
-            # Використовуємо обмежувач 5 RPM (12s)
-            await rate_limited_ai_call()
+            # --- ПЕРЕВІРКА КЕШУ ШІ ---
+            now = asyncio.get_event_loop().time()
+            if slug in AI_DECISION_CACHE:
+                cached = AI_DECISION_CACHE[slug]
+                if now - cached["timestamp"] < AI_CACHE_TTL:
+                    logger.info(f"💾 [{source}] Використовуємо кешоване рішення ШІ для: '{title}'")
+                    ai_decision = cached["decision"]
+                else:
+                    # Час кешу вийшов, робимо новий запит
+                    await rate_limited_ai_call()
+                    ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
+                    AI_DECISION_CACHE[slug] = {"decision": ai_decision, "timestamp": now}
+            else:
+                # Новий ринок, робимо запит
+                await rate_limited_ai_call()
+                ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
+                AI_DECISION_CACHE[slug] = {"decision": ai_decision, "timestamp": now}
             
-            ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
             confidence = ai_decision.get("confidence", 0)
             should_trade = ai_decision.get("trade", False)
             fair_value = ai_decision.get("fair_value", ai_price)
