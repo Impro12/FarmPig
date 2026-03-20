@@ -1,560 +1,448 @@
+"""
+Polymarket Copy-Trading Bot (Paper Mode)
+=========================================
+Reads signals from a Telegram channel (e.g. @PolyBeatsEN style),
+resolves the Polymarket prediction market, and executes virtual paper trades.
+Reports trade events and PnL summaries to a Telegram chat.
+
+Signal format handled (PolyBeats channel style):
+    New Address Wagers $26k That U.S. Troops Will Enter Iran This Year
+
+    On the prediction market Polymarket, a new address has invested $26k in
+    the "Yes" outcome for "Will U.S. troops enter Iran this year?"
+    The current probability for this event is 71%.
+    ...
+    Total Investment: $26k
+"""
+
 import os
+import re
 import json
 import asyncio
 import logging
-import requests
-import asyncpg
-import websockets
-from typing import List, Dict, Any, Optional
+import aiohttp
+from datetime import datetime, timezone
+from typing import Optional
 from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.tl.types import PeerChannel, Channel
 
-from google import genai
-from google.genai import types
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-
-# Налаштування логування
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ─── Logging ────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-8s │ %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
-# --- ВАЖЛИВІ НАЛАШТУВАННЯ ---
-SIMULATION_MODE = True  # True = Paper Trading на Agent Arena, False = Реальні угоди
-TOTAL_BANKROLL_USD = 100.0   # Твій загальний банк для реальних угод (в USD)
-MAX_SLIPPAGE_PCT = 0.03  # 3% максимальне прослизання
-KELLY_MULTIPLIER = 0.25  # Quarter-Kelly (консервативний підхід)
-MAX_BET_PERCENTAGE = 0.05 # Ніколи не ставити більше 5% від банку (Ризик-менеджмент)
-AGENT_ID = "MoneyPigBot"
-POLYMARKETSCAN_API_URL = "https://gzydspfquuaudqeztorw.supabase.co/functions/v1/agent-api"
-
-# Гаманці китів для відстеження (буде оновлюватися динамічно)
-WHALE_WALLETS = set()
-PROCESSED_SLUGS = set() # Зберігаємо slug ринків, де ми вже відторгували
-WHALE_DISCOVERY_THRESHOLD_USD = 10000  # Фікс: мінімальний розмыр транзакції щоб вважати китом, можна збільшувати
-CTF_EXCHANGE_ADDRESS = "0x4bFB41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Контракт Polymarket CTF
-
-# Кеш рішень ШІ (щоб не питати Gemini про той самий ринок занадто часто)
-# Формат: {slug: {"decision": dict, "timestamp": float}}
-AI_DECISION_CACHE = {}
-AI_CACHE_TTL = 3600  # 1 година (в секундах)
-
-# Завантажуємо змінні середовища
+# ─── Config ─────────────────────────────────────────────────────────────────
 load_dotenv()
 
-PRIVATE_KEY = os.getenv("POLYGON_PRIVATE_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
-QUICKNODE_WSS_URL = os.getenv("QUICKNODE_WSS_URL")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_API_ID   = int(os.getenv("TELEGRAM_API_ID") or "0")
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
+SIGNAL_CHANNEL    = os.getenv("SIGNAL_CHANNEL", "")      # e.g. @PolyBeatsEN or https://t.me/...
+VIRTUAL_BALANCE   = float(os.getenv("VIRTUAL_BALANCE", "10000"))
 
-# Обмежувач швидкості (Rate Limiter) - 5 запитів на ХВИЛИНУ
-# 60 сек / 5 = 12 секунд між запитами
-async def rate_limited_ai_call():
-    """Забезпечує паузу 12 секунд для дотримання ліміту 5 RPM"""
-    logger.info("⏳ Очікування 12с для дотримання ліміту 5 RPM...")
-    await asyncio.sleep(12) 
+# Polymarket public API endpoints (no auth required)
+GAMMA_API   = "https://gamma-api.polymarket.com"
+CLOB_API    = "https://clob.polymarket.com"
 
-# Ініціалізація пулу бази даних
-db_pool = None
+# PnL report interval (seconds)
+PNL_REPORT_INTERVAL = 3600  # 1 hour
 
-async def init_db():
-    global db_pool
-    if not DATABASE_URL:
-        logger.info("DATABASE_URL не знайдено, пропускаємо ініціалізацію БД.")
-        return
-    try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL)
-        async with db_pool.acquire() as conn:
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS trades (
-                    id SERIAL PRIMARY KEY,
-                    market_slug VARCHAR(255),
-                    market_id VARCHAR(255),
-                    side VARCHAR(10),
-                    execution_price FLOAT,
-                    amount_usd FLOAT,
-                    fair_value FLOAT,
-                    confidence INT,
-                    reason TEXT,
-                    is_simulation BOOLEAN,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-        logger.info("✅ База даних PostgreSQL успішно ініціалізована (таблиця trades).")
-    except Exception as e:
-        logger.error(f"❌ Помилка підключення до БД: {e}")
+# ─── In-memory paper portfolio ───────────────────────────────────────────────
+portfolio = {
+    "balance_usd": VIRTUAL_BALANCE,
+    "positions": {},   # { position_id: {...} }
+    "closed_trades": [],
+    "total_pnl": 0.0,
+}
+_position_counter = 0
 
-async def load_processed_slugs():
-    """Завантажує вже відпрацьовані ринки з бази даних, щоб не дублювати угоди після перезапуску."""
-    global PROCESSED_SLUGS
-    if not db_pool:
-        return
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT DISTINCT market_slug FROM trades")
-            for row in rows:
-                PROCESSED_SLUGS.add(row['market_slug'])
-        logger.info(f"📁 Завантажено {len(PROCESSED_SLUGS)} відпрацьованих ринків з БД.")
-    except Exception as e:
-        logger.error(f"Помилка завантаження processed_slugs: {e}")
-
-# Ініціалізація клієнта Gemini
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
-def init_clob_client() -> Optional[ClobClient]:
-    """Ініціалізація офіційного клієнта Polymarket (py-clob-client)."""
-    if not PRIVATE_KEY:
-        logger.warning("ГЕНЕРАЦІЯ РЕАЛЬНИХ ОРДЕРІВ НЕМОЖЛИВА: POLYGON_PRIVATE_KEY не знайдений.")
-        return None
-    try:
-        # Host та Chain ID для Polygon Mainnet
-        client = ClobClient(
-            host="https://clob.polymarket.com",
-            key=PRIVATE_KEY,
-            chain_id=137
-        )
-        client.set_api_creds(client.create_or_derive_api_creds())
-        return client
-    except Exception as e:
-        logger.error(f"Помилка ініціалізації ClobClient: {e}")
-        return None
-
-clob_client = init_clob_client() if not SIMULATION_MODE else None
-
-async def send_telegram_message(text: str):
-    """Надсилає повідомлення у Telegram"""
+# ─── Telegram sender (via Bot API) ──────────────────────────────────────────
+async def send_telegram(session: aiohttp.ClientSession, text: str):
+    """Send a message to TELEGRAM_CHAT_ID via Bot API."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram bot token / chat id not set — skipping notification.")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        await asyncio.to_thread(requests.post, url, json=payload, timeout=5)
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                logger.warning(f"Telegram sendMessage returned {r.status}")
     except Exception as e:
-        logger.error(f"Помилка відправки в Telegram: {e}")
+        logger.error(f"Telegram send error: {e}")
 
-async def fetch_opportunities() -> List[Dict[str, Any]]:
+# ─── Signal Parser ───────────────────────────────────────────────────────────
+def parse_signal(text: str) -> Optional[dict]:
     """
-    Отримує ринки з найбільшою розбіжністю (AI vs Humans) через API PolymarketScan.
-    """
-    try:
-        url = f"{POLYMARKETSCAN_API_URL}?action=ai-vs-humans&limit=5"
-        response = await asyncio.to_thread(requests.get, url, timeout=10)
-        response.raise_for_status()
-        data = response.json().get("data", [])
-        return data
-    except Exception as e:
-        logger.error(f"Помилка отримання AI vs Humans opportunities: {e}")
-        return []
+    Parse a PolyBeats-style signal message.
 
-async def fetch_market_details(slug: str) -> Optional[Dict[str, Any]]:
+    Returns dict with keys:
+        market_query  – market title to search on Polymarket
+        side          – "YES" or "NO"
+        amount_usd    – dollar amount invested (float)
+        probability   – current probability (float 0-1) or None
+        wallet        – whale wallet (str) or None
+
+    Returns None if the message doesn't look like a valid signal.
     """
-    Отримує детальні дані ринку, щоб дізнатися Market ID (Condition ID).
-    """
-    try:
-        url = f"{POLYMARKETSCAN_API_URL}?action=market&slug={slug}"
-        response = await asyncio.to_thread(requests.get, url, timeout=10)
-        response.raise_for_status()
-        return response.json().get("data")
-    except Exception as e:
-        logger.error(f"Помилка отримання деталей ринку {slug}: {e}")
+    # Must mention Polymarket to be considered a signal
+    if "polymarket" not in text.lower():
         return None
 
-async def validate_trade_with_ai(market_title: str, current_price: float, ai_consensus: float, direction: str) -> Dict[str, Any]:
-    """
-    Оцінює розбіжність за допомогою LLM.
-    """
-    if not gemini_client:
-        logger.error("Gemini API Key не налаштований. Пропускаємо перевірку AI.")
-        return {"confidence": 0, "trade": False, "reason": "No API Key", "fair_value": ai_consensus}
-
-    system_prompt = (
-        "Ти — елітний Quant Researcher та аналітик ринків прогнозів Polymarket. "
-        "Твоє завдання — аналізувати розбіжності між прогнозом AI та поточною Polymarket ціною (Humans). "
-        "Будь консервативним. Якщо розбіжність виглядає як помилка чи шум на хайповому ринку, відхиляй угоду. "
-        "Відповідай виключно у форматі JSON. "
-        "Схема JSON: {\"confidence\": int (від 0 до 100), \"trade\": bool, \"reason\": str, \"fair_value\": float}."
+    # ── side: look for 'Yes' or 'No' outcome ─────────────────────────────────
+    side_match = re.search(
+        r'invested.*?in\s+the\s+"(Yes|No)"\s+outcome',
+        text, re.IGNORECASE
     )
-    
-    user_prompt = (
-        f"Ринок: '{market_title}'\n"
-        f"Поточна ціна на Polymarket: {current_price}$\n"
-        f"Незалежний консенсус AI-моделей: {ai_consensus}$\n"
-        f"Напрямок розбіжності (Divergence Direction): {direction}\n"
-        f"Запитуємо твій висновок: чи є тут математична перевага (edge) для ставки у напрямку {direction}? "
-        f"Також поверни fair_value (твою впевненість у відсотках ймовірності, наприклад 0.75)."
+    if not side_match:
+        # Fallback: first occurrence of bare "Yes"/"No" near "outcome"
+        side_match = re.search(r'"(Yes|No)"\s+outcome', text, re.IGNORECASE)
+    if not side_match:
+        logger.info("Signal skipped — could not determine side (Yes/No).")
+        return None
+    side = side_match.group(1).upper()
+
+    # ── market title: text inside quotes after "for" ─────────────────────────
+    title_match = re.search(
+        r'(?:outcome\s+for\s+|for the market\s+|market[:\s]+)"([^"]+)"',
+        text, re.IGNORECASE
     )
+    if not title_match:
+        # Try: quotes anywhere after "outcome"
+        title_match = re.search(r'outcome.*?"([^"]{10,})"', text, re.IGNORECASE | re.DOTALL)
+    if not title_match:
+        logger.info("Signal skipped — could not extract market title.")
+        return None
+    market_query = title_match.group(1).strip()
 
-    try:
-        response = await gemini_client.aio.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.2, 
-                response_mime_type="application/json",
-            )
-        )
-        
-        result_str = response.text
-        if result_str:
-            result_json = json.loads(result_str)
-            if "fair_value" not in result_json:
-                 result_json["fair_value"] = ai_consensus
-            return result_json
-        else:
-            return {"confidence": 0, "trade": False, "reason": "Empty AI response", "fair_value": ai_consensus}
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"Помилка парсингу JSON від AI: {e}")
-    except Exception as e:
-        logger.error(f"Помилка виклику AI: {e}")
-        
-    return {"confidence": 0, "trade": False, "reason": "System Error", "fair_value": ai_consensus}
+    # ── amount ────────────────────────────────────────────────────────────────
+    # "Total Investment: $26k" or "invested $26k" or "$1.5M"
+    amount_match = re.search(
+        r'(?:Total Investment|invested|Wagers?)\s*:?\s*\$([0-9,.]+)\s*([kKmMbB]?)',
+        text, re.IGNORECASE
+    )
+    if not amount_match:
+        amount_match = re.search(r'\$([0-9,.]+)\s*([kKmMbB]?)', text)
+    amount_usd = 0.0
+    if amount_match:
+        raw = float(amount_match.group(1).replace(",", ""))
+        suffix = amount_match.group(2).upper()
+        multipliers = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+        amount_usd = raw * multipliers.get(suffix, 1)
 
-def calculate_optimal_bet(fair_value: float, current_price: float, current_bankroll: float) -> float:
-    """Обчислює розмір ставки за адаптованим критерієм Келлі (Quarter-Kelly)"""
-    if current_bankroll <= 0:
-        return 0.0
-        
-    edge = fair_value - current_price
-    
-    # Якщо переваги (edge) немає або вона від'ємна — не торгуємо взагалі
-    if edge <= 0:
-        return 0.0
-        
-    # Формула Келлі для бінарних опціонів: f* = (P - C) / (1 - C)
-    # Де C - поточна ціна (ямости ставки), P - наша впевненість.
-    # Так як тут "ставка" = 1, прибуток = 1 - C
-    if current_price >= 1.0: return 0.0 # Захист від ділення на 0
-    
-    kelly_fraction = edge / (1.0 - current_price)
-    
-    # Регулювання ризику (Quarter Kelly)
-    adj_kelly_fraction = kelly_fraction * KELLY_MULTIPLIER
-    
-    # Обмеження максимуму
-    safest_fraction = min(adj_kelly_fraction, MAX_BET_PERCENTAGE)
-    if safest_fraction <= 0: return 0.0
-    
-    bet_amount = current_bankroll * safest_fraction
-    return round(bet_amount, 2)
+    # ── probability ───────────────────────────────────────────────────────────
+    prob_match = re.search(
+        r'(?:current\s+probability|probability).*?(?:is|:)\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+        text, re.IGNORECASE
+    )
+    probability = float(prob_match.group(1)) / 100.0 if prob_match else None
 
-async def execute_trade(opportunity: Dict[str, Any], ai_decision: Dict[str, Any], amount_usd: float):
-    """
-    Реєструє угоду.
-    В SIMULATION_MODE відправляє в Agent Arena API.
-    В LIVE (SIMULATION_MODE=False) - купує через py-clob-client.
-    """
-    market_slug = opportunity.get("slug")
-    if not market_slug:
-         logger.warning("Оппортьюніті не містить slug.")
-         return
-         
-    # Отримуємо додаткові деталі ринку для market_id
-    market_details = await fetch_market_details(market_slug)
-    market_id = market_details.get("market_id") if market_details else market_slug # Fallback до slug якщо щось піде не так
-    
-    direction = opportunity.get("divergenceDirection", "bullish")
-    side = "YES" if direction.lower() == "bullish" else "NO"
-    market_price = float(opportunity.get("polymarketPrice", 0.5))
-    fair_value = ai_decision.get("fair_value", 0.5)
+    # ── wallet ────────────────────────────────────────────────────────────────
+    wallet_match = re.search(r'0x[a-fA-F0-9]{40}', text)
+    wallet = wallet_match.group(0) if wallet_match else None
 
-    if SIMULATION_MODE:
-        logger.info(f"[PAPER TRADE / ARENA] Відправка: {side} на {market_slug} | "
-                    f"Ціна: ${market_price} | Сума: ${amount_usd} | Fair Value: {fair_value}")
-        try:
-            payload = {
-                "agent_id": AGENT_ID,
-                "market_id": market_id,
-                "side": side,
-                "amount": amount_usd,
-                "action": "BUY",
-                "fair_value": fair_value
-            }
-            url = f"{POLYMARKETSCAN_API_URL}?action=place_order"
-            response = await asyncio.to_thread(requests.post, url, json=payload, timeout=10)
-            result = response.json()
-            if result.get("ok"):
-                logger.info(f"✅ [ARENA SUCCESS] Угода прийнята симулятором: {result.get('data')}")
-            else:
-                logger.warning(f"❌ [ARENA ERROR] Відхилено Ареною: {result}")
-        except Exception as e:
-            logger.error(f"❌ [ARENA NETWORK ERROR] {e}")
-        return
-
-    # Реальна торгівля на Polygon
-    try:
-        if not clob_client:
-            raise ValueError("ClobClient не ініціалізовано!")
-
-        max_price = round(market_price * (1.0 + MAX_SLIPPAGE_PCT), 3)
-        if max_price > 0.99: max_price = 0.99
-        size = round(amount_usd / max_price, 2)
-             
-        # Увага: Для реальної торгівлі потрібен CLOB Token ID (специфічний для YES/NO). 
-        # API PolymarketScan повертає його масивом у market_details. 
-        # Якщо немає - реальна торгівля впаде.
-        clob_tokens = market_details.get("clobTokenIds", []) if market_details else []
-        if not clob_tokens or len(clob_tokens) < 2:
-            logger.error(f"Не знайдено ClobToken Ids для ринку {market_slug}. Trade cancelled.")
-            return
-            
-        token_id = clob_tokens[0] if side == "YES" else clob_tokens[1]
-
-        logger.info(f"[LIVE TRADE] Купую {side} (Token: {token_id}) по {max_price} на суму ${amount_usd}")
-
-        order_args = OrderArgs(
-            price=max_price,
-            size=size,
-            side="BUY",
-            token_id=token_id
-        )
-
-        signed_order = clob_client.create_order(order_args)
-        resp = clob_client.post_order(signed_order, order_type=OrderType.FOK)
-        
-        if resp and resp.get("success"):
-            logger.info(f"✅ [SUCCESS] Ордер виконано! ID: {resp.get('orderID')}")
-        else:
-            logger.warning(f"⚠️ [FAILED] Відхилено Polymarket: {resp.get('errorMsg', resp)}")
-
-    except Exception as e:
-        logger.error(f"[ERROR] Помилка виконання Live-угоди: {e}")
-
-    # Після успішного (або симульованого) виконання - запишемо в PostgreSQL (якщо доступно)
-    if db_pool:
-        try:
-            # Для симуляції ціна виконання = market_price, для лайву = max_price
-            exec_price = market_price if SIMULATION_MODE else max_price
-            async with db_pool.acquire() as conn:
-                await conn.execute('''
-                    INSERT INTO trades 
-                    (market_slug, market_id, side, execution_price, amount_usd, fair_value, confidence, reason, is_simulation)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ''', market_slug, market_id, side, exec_price, amount_usd, fair_value, ai_decision.get("confidence", 0), ai_decision.get("reason", ""), SIMULATION_MODE)
-        except Exception as db_e:
-            logger.error(f"Помилка запису в БД: {db_e}")
-
-# Глобальна змінна для віртуального балансу Арени
-current_arena_portfolio_value = 1000.0
-
-async def check_arena_portfolio():
-    """Перевіряємо поточний баланс Агента в Арені."""
-    global current_arena_portfolio_value
-    if SIMULATION_MODE:
-        try:
-            url = f"{POLYMARKETSCAN_API_URL}?action=my_portfolio&agent_id={AGENT_ID}"
-            response = await asyncio.to_thread(requests.get, url, timeout=10)
-            data = response.json().get("data", {})
-            value = data.get("portfolio_value", 0)
-            if value > 0:
-                current_arena_portfolio_value = value
-            logger.info(f"📊 Поточний Portfolio Value в Arena: ${current_arena_portfolio_value}")
-        except:
-             pass
-
-async def fetch_initial_whales():
-    """Завантажує початковий список китів з API на старті бота"""
-    try:
-        url = f"{POLYMARKETSCAN_API_URL}?action=whales&limit=20"
-        logger.info(f"Завантаження початкових китів з: {url}")
-        
-        # Асинхронно робимо HTTP запит
-        response = await asyncio.to_thread(requests.get, url, timeout=10)
-        data = response.json().get("data", [])
-        
-        for w in data:
-            wallet = w.get("wallet")
-            if wallet:
-                WHALE_WALLETS.add(wallet.lower())
-                
-        logger.info(f"🐳 Успішно завантажено {len(WHALE_WALLETS)} китів для відстеження.")
-    except Exception as e:
-        logger.error(f"Помилка завантаження первинних китів: {e}")
-
-async def listen_to_whales_ws():
-    """Слухає QuickNode WebSockets для швидкої реакції на події китів (без поллінгу)."""
-    if not QUICKNODE_WSS_URL or not QUICKNODE_WSS_URL.startswith("wss://"):
-        logger.error("QUICKNODE_WSS_URL не налаштований. WebSocket трекер вимкнено. Працюватиме лише Автономний сканер.")
-        while True:
-            await asyncio.sleep(3600)
-        return
-
-    logger.info(f"🔗 Підключення до QuickNode WebSocket...")
-    
-    # Підписуємось на TransferSingle (Erc1155) події контракту Polymarket
-    # topic0 для `TransferSingle(address operator, address from, address to, uint256 id, uint256 value)`
-    # Це: 0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62
-    transfer_single_topic = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
-    
-    subscription_payload = {
-        "id": 1,
-        "jsonrpc": "2.0",
-        "method": "eth_subscribe",
-        "params": [
-            "logs",
-            {
-                "address": CTF_EXCHANGE_ADDRESS, # Тільки логи з головного контракту Polymarket
-                "topics": [transfer_single_topic] 
-            }
-        ]
+    return {
+        "market_query": market_query,
+        "side": side,
+        "amount_usd": amount_usd,
+        "probability": probability,
+        "wallet": wallet,
+        "raw_text": text[:300],
     }
 
-    while True:
-        try:
-            async with websockets.connect(QUICKNODE_WSS_URL) as ws:
-                await ws.send(json.dumps(subscription_payload))
-                response = await ws.recv()
-                logger.info(f"✅ Успішна підписка на CTF Exchange! Шукаю китів та їхні рухи... ID: {json.loads(response).get('result')}")
-
-                while True:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-                    
-                    if "params" in data and "result" in data["params"]:
-                        log_data = data["params"]["result"]
-                        topics = log_data.get("topics", [])
-                        
-                        if len(topics) >= 4:
-                            # Парсимо TransferSingle: operator, from, to знаходяться в topics[1], topics[2], topics[3] відповідно
-                            # Адреса покупця ("to")
-                            to_address = "0x" + topics[3][26:].lower()
-                            tx_hash = log_data.get("transactionHash")
-                            
-                            # Перевіряємо, чи ми знаємо цього гаманця
-                            if to_address in WHALE_WALLETS:
-                                logger.info(f"🐋 Знайомий Кит діє! Tx: {tx_hash} | {to_address}")
-                                asyncio.create_task(process_opportunities_on_event())
-                            else:
-                                # Data містить [id, value] без індексів (розділено на 2 юінти по 32 байти)
-                                unindexed_data = log_data.get("data", "0x")[2:]
-                                if len(unindexed_data) >= 128:
-                                    value_hex = unindexed_data[64:128] # Друга частина
-                                    try:
-                                        value_int = int(value_hex, 16)
-                                        # Тут дуже спрощено: value_int / 1e6 (якщо це USDC shares). 
-                                        usd_estimate = value_int / 10**6 
-                                        
-                                        if usd_estimate >= WHALE_DISCOVERY_THRESHOLD_USD:
-                                            logger.info(f"🚨🚨 НОВИЙ КИТ ВИЯВЛЕНИЙ! 🚨🚨")
-                                            logger.info(f"Гаманець: {to_address} | Об'єм: ~${usd_estimate:,.2f} | Tx: {tx_hash}")
-                                            WHALE_WALLETS.add(to_address)
-                                            await send_telegram_message(f"🚨 <b>НОВИЙ КИТ ВИЯВЛЕНИЙ!</b> 🚨\nГаманець: <code>{to_address}</code>\nОб'єм угоди: <b>~${usd_estimate:,.2f}</b>\nTx: <code>{tx_hash}</code>")
-                                            # Ми знайшли нового кита, значить він щойно купив, давайте аналізувати
-                                            asyncio.create_task(process_opportunities_on_event())
-                                    except Exception as parse_e:
-                                        pass
-                                
-        except Exception as e:
-            logger.error(f"WebSocket відключився ({e}). Реконект через 5 сек...")
-            await asyncio.sleep(5)
-
-async def process_opportunities_on_event(source="WHALE"):
-    """Викликається коли WebSocket фіксує рух або по таймеру. Аналізує ринки і приймає рішення."""
+# ─── Polymarket Market Resolver ──────────────────────────────────────────────
+async def resolve_market(session: aiohttp.ClientSession, query: str) -> Optional[dict]:
+    """
+    Search Polymarket Gamma API for a market matching `query`.
+    Returns market dict with token_ids, slug, etc. or None.
+    """
     try:
-        opps = await fetch_opportunities()
-        for opp in opps:
-            slug = opp.get("slug")
-            if not slug or slug in PROCESSED_SLUGS:
-                continue
-
-            title = opp.get("title", "Unknown")
-            pm_price = float(opp.get("polymarketPrice", 0))
-            ai_price = float(opp.get("aiConsensus", 0))
-            direction = opp.get("divergenceDirection", "unknown")
-            
-            # --- ОПТИМІЗАЦІЯ КВОТИ ---
-            # Якщо розбіжність занадто мала (< 3%), ми навіть не питаємо ШІ, щоб економити ліміти API.
-            edge = abs(pm_price - ai_price)
-            if edge < 0.03:
-                logger.info(f"⏭️ [{source}] Скіп: '{title}' (Замалий Edge: {edge*100:.1f}%)")
-                continue
-                
-            logger.info(f"💡 [{source}] Знайдено оппортьюніті: '{title}' | PM: {pm_price} | AI: {ai_price} ({direction})")
-            
-            # --- ПЕРЕВІРКА КЕШУ ШІ ---
-            now = asyncio.get_event_loop().time()
-            if slug in AI_DECISION_CACHE:
-                cached = AI_DECISION_CACHE[slug]
-                if now - cached["timestamp"] < AI_CACHE_TTL:
-                    logger.info(f"💾 [{source}] Використовуємо кешоване рішення ШІ для: '{title}'")
-                    ai_decision = cached["decision"]
-                else:
-                    # Час кешу вийшов, робимо новий запит
-                    await rate_limited_ai_call()
-                    ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
-                    AI_DECISION_CACHE[slug] = {"decision": ai_decision, "timestamp": now}
-            else:
-                # Новий ринок, робимо запит
-                await rate_limited_ai_call()
-                ai_decision = await validate_trade_with_ai(title, pm_price, ai_price, direction)
-                AI_DECISION_CACHE[slug] = {"decision": ai_decision, "timestamp": now}
-            
-            confidence = ai_decision.get("confidence", 0)
-            should_trade = ai_decision.get("trade", False)
-            fair_value = ai_decision.get("fair_value", ai_price)
-            
-            if should_trade and confidence >= 70:
-                # Дані для сайзунга
-                bankroll = current_arena_portfolio_value if SIMULATION_MODE else TOTAL_BANKROLL_USD
-                optimal_bet = calculate_optimal_bet(fair_value, pm_price, bankroll)
-                
-                logger.info(f"📐 Розрахований Kelly Size: ${optimal_bet} (з банку ${bankroll})")
-                
-                if optimal_bet >= 1.0: # Polymarket mini bet size roughly ~$1
-                    logger.info("🚀 Розмір ставки валідний. Виконання...")
-                    
-                    # Відправка в Telegram
-                    mode_str = "🎮 ARENA" if SIMULATION_MODE else "🔴 LIVE"
-                    msg = (f"🚀 <b>MoneyPigBot торгує! [{mode_str}] ({source})</b>\n\n"
-                           f"<b>Ринок:</b> {title}\n"
-                           f"<b>Рішення:</b> {direction.upper()}\n"
-                           f"<b>Ціна:</b> ${pm_price}\n"
-                           f"<b>Впевненість ШІ:</b> {confidence}%\n"
-                           f"<b>Ставка (Quarter-Kelly):</b> ${optimal_bet}")
-                    await send_telegram_message(msg)
-                    
-                    await execute_trade(opp, ai_decision, optimal_bet)
-                    PROCESSED_SLUGS.add(slug)
-                else:
-                    logger.info("⛔ Ставка занадто мала, пропускаємо (Kelly < $1.0) або немає математичної переваги.")
-            else:
-                logger.info("⛔ Відхилено ШІ.")
-                
+        params = {"q": query, "limit": 5, "active": "true", "closed": "false"}
+        async with session.get(
+            f"{GAMMA_API}/markets",
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            r.raise_for_status()
+            data = await r.json()
+            markets = data if isinstance(data, list) else data.get("markets", [])
+            if not markets:
+                logger.warning(f"No markets found for query: '{query}'")
+                return None
+            # Pick the first active market
+            return markets[0]
     except Exception as e:
-        logger.error(f"Помилка під час обробки події: {e}")
+        logger.error(f"Gamma API error: {e}")
+        return None
 
-async def run_autonomous_scanner():
-    """Фонова задача, яка перевіряє арбітражні можливості самостійно кожні 15 хвилин."""
-    # Інтервал 900 сек (15 хв) замість 300 сек, щоб не перевищити ліміт Gemini Free Tier (1500 RPD)
-    logger.info(f"⏳ Автономний сканер запущено. Інтервал: 900 сек.")
+async def get_market_price(session: aiohttp.ClientSession, token_id: str, side: str = "YES") -> Optional[float]:
+    """
+    Fetch midpoint price for a Polymarket token from CLOB API.
+    side: 'YES' or 'NO'
+    """
+    try:
+        async with session.get(
+            f"{CLOB_API}/midpoint",
+            params={"token_id": token_id},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            r.raise_for_status()
+            data = await r.json()
+            price = float(data.get("mid", 0))
+            # For NO side the price is 1 - YES price
+            return (1.0 - price) if side == "NO" else price
+    except Exception as e:
+        logger.error(f"CLOB price fetch error for token {token_id}: {e}")
+        return None
+
+def get_token_id(market: dict, side: str) -> Optional[str]:
+    """Extract the YES or NO token_id from a Gamma market object."""
+    tokens = market.get("tokens") or market.get("outcomePrices", [])
+    # tokens is usually a list of dicts: [{outcome: "Yes", token_id: "..."}, ...]
+    if isinstance(tokens, list):
+        for t in tokens:
+            if isinstance(t, dict):
+                outcome = (t.get("outcome") or "").upper()
+                if outcome == side:
+                    return t.get("token_id") or t.get("tokenId")
+    # Fallback: some responses store clobTokenIds as a pair [yes_id, no_id]
+    clob_ids = market.get("clobTokenIds") or market.get("clob_token_ids", [])
+    if isinstance(clob_ids, list) and len(clob_ids) >= 2:
+        return clob_ids[0] if side == "YES" else clob_ids[1]
+    return None
+
+# ─── Paper Trading Engine ────────────────────────────────────────────────────
+def open_position(market: dict, side: str, entry_price: float, amount_usd: float, signal: dict) -> dict:
+    global _position_counter
+    _position_counter += 1
+    pos_id = _position_counter
+
+    # Shares bought = amount / entry_price  (each share pays $1 if correct)
+    shares = amount_usd / entry_price if entry_price > 0 else 0
+
+    position = {
+        "id": pos_id,
+        "market_slug": market.get("slug", "unknown"),
+        "market_title": market.get("question") or market.get("title", signal["market_query"]),
+        "side": side,
+        "entry_price": entry_price,
+        "entry_amount_usd": amount_usd,
+        "shares": shares,
+        "token_id": get_token_id(market, side),
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "current_price": entry_price,
+        "unrealized_pnl": 0.0,
+        "whale_wallet": signal.get("wallet"),
+        "market": market,
+    }
+    portfolio["positions"][pos_id] = position
+    portfolio["balance_usd"] -= amount_usd
+    logger.info(f"[PAPER] Opened position #{pos_id}: {side} on '{position['market_title']}' "
+                f"@ {entry_price:.3f} | ${amount_usd:.2f} | {shares:.2f} shares")
+    return position
+
+async def update_positions(session: aiohttp.ClientSession):
+    """Refresh current prices for all open positions and recalculate PnL."""
+    for pos_id, pos in list(portfolio["positions"].items()):
+        token_id = pos.get("token_id")
+        if not token_id:
+            continue
+        price = await get_market_price(session, token_id, pos["side"])
+        if price is None:
+            continue
+        pos["current_price"] = price
+        pos["unrealized_pnl"] = (price - pos["entry_price"]) * pos["shares"]
+
+def portfolio_summary() -> str:
+    """Build a human-readable portfolio summary."""
+    total_invested = sum(p["entry_amount_usd"] for p in portfolio["positions"].values())
+    total_unrealized = sum(p["unrealized_pnl"] for p in portfolio["positions"].values())
+    realized = sum(t.get("realized_pnl", 0) for t in portfolio["closed_trades"])
+    total_pnl = total_unrealized + realized
+
+    lines = [
+        "📊 <b>Paper Portfolio — Polymarket Copy-Trader</b>",
+        f"💰 Cash: <b>${portfolio['balance_usd']:,.2f}</b>",
+        f"📈 Open Positions: <b>{len(portfolio['positions'])}</b> (${total_invested:,.2f} invested)",
+        f"🟢 Unrealized PnL: <b>${total_unrealized:+,.2f}</b>",
+        f"✅ Realized PnL: <b>${realized:+,.2f}</b>",
+        f"📉 Total PnL: <b>${total_pnl:+,.2f}</b>",
+        "",
+    ]
+
+    for pos in portfolio["positions"].values():
+        arrow = "🟢" if pos["unrealized_pnl"] >= 0 else "🔴"
+        lines.append(
+            f"{arrow} #{pos['id']} <b>{pos['side']}</b> – {pos['market_title'][:60]}\n"
+            f"   Entry: {pos['entry_price']:.3f} → Now: {pos['current_price']:.3f} | "
+            f"PnL: <b>${pos['unrealized_pnl']:+,.2f}</b>"
+        )
+
+    if portfolio["closed_trades"]:
+        lines.append("\n<b>Recent Closed Trades:</b>")
+        for t in portfolio["closed_trades"][-5:]:
+            emoji = "✅" if t["realized_pnl"] >= 0 else "❌"
+            lines.append(f"{emoji} {t['side']} {t['market_title'][:50]} → ${t['realized_pnl']:+,.2f}")
+
+    return "\n".join(lines)
+
+# ─── Main Signal Handler ─────────────────────────────────────────────────────
+async def handle_signal(event, session: aiohttp.ClientSession):
+    """Process an incoming Telegram message as a potential trading signal."""
+    text = event.raw_text or ""
+    logger.info(f"New message ({len(text)} chars). Checking for signal...")
+
+    signal = parse_signal(text)
+    if not signal:
+        logger.info("→ Not a valid signal, skipping.")
+        return
+
+    logger.info(f"✅ Signal detected: {signal['side']} on '{signal['market_query']}' "
+                f"| Amount: ${signal['amount_usd']:,.0f} | Prob: {signal['probability']}")
+
+    # Resolve market on Polymarket
+    market = await resolve_market(session, signal["market_query"])
+    if not market:
+        await send_telegram(
+            session,
+            f"⚠️ <b>Signal received but market not found on Polymarket</b>\n"
+            f"Query: <i>{signal['market_query']}</i>"
+        )
+        return
+
+    market_title = market.get("question") or market.get("title", signal["market_query"])
+    market_slug  = market.get("slug", "")
+    market_url   = f"https://polymarket.com/event/{market_slug}" if market_slug else "https://polymarket.com"
+
+    # Get token ID and current price
+    token_id = get_token_id(market, signal["side"])
+    if not token_id:
+        logger.warning(f"Could not find token_id for {signal['side']} on market: {market_title}")
+
+    entry_price = await get_market_price(session, token_id, signal["side"]) if token_id else signal["probability"]
+    if entry_price is None:
+        entry_price = signal["probability"] or 0.5
+
+    # Determine paper trade size: mirror the whale's bet scaled to our virtual balance,
+    # capped at 10% of balance per trade.
+    bet_cap = portfolio["balance_usd"] * 0.10
+    if signal["amount_usd"] > 0:
+        # Scale proportionally: whale ratio = amount / some "full bet" reference of 50,000
+        REFERENCE_WHALE_BET = 50_000
+        ratio = min(signal["amount_usd"] / REFERENCE_WHALE_BET, 1.0)
+        paper_bet = round(ratio * VIRTUAL_BALANCE * 0.10, 2)
+        paper_bet = max(10.0, min(paper_bet, bet_cap))
+    else:
+        paper_bet = round(bet_cap * 0.25, 2)  # default: 2.5% of balance
+
+    if portfolio["balance_usd"] < paper_bet:
+        await send_telegram(
+            session,
+            f"⚠️ Insufficient paper balance (${portfolio['balance_usd']:.2f}) to copy trade."
+        )
+        return
+
+    # Open paper position
+    pos = open_position(market, signal["side"], entry_price, paper_bet, signal)
+
+    # Send Telegram notification
+    whale_info = ""
+    if signal.get("wallet"):
+        short_wallet = signal["wallet"][:6] + "..." + signal["wallet"][-4:]
+        whale_info = f"\n🐋 Whale: <code>{short_wallet}</code> (real: ${signal['amount_usd']:,.0f})"
+
+    prob_str = f"{signal['probability']*100:.0f}%" if signal["probability"] else "N/A"
+    msg = (
+        f"🚀 <b>Paper Trade Opened</b> #{pos['id']}\n\n"
+        f"📌 <b>Market:</b> <a href='{market_url}'>{market_title[:80]}</a>\n"
+        f"📍 <b>Side:</b> {signal['side']}\n"
+        f"💵 <b>Entry Price:</b> {entry_price:.3f} ({prob_str} prob)\n"
+        f"💰 <b>Paper Bet:</b> ${paper_bet:,.2f}\n"
+        f"🎯 <b>Potential Payout:</b> ${pos['shares']:.2f}"
+        f"{whale_info}\n\n"
+        f"💼 Remaining Cash: ${portfolio['balance_usd']:,.2f}"
+    )
+    await send_telegram(session, msg)
+
+# ─── Hourly PnL Reporter ─────────────────────────────────────────────────────
+async def pnl_reporter(session: aiohttp.ClientSession):
+    """Background task: refresh positions and send PnL report every hour."""
     while True:
+        await asyncio.sleep(PNL_REPORT_INTERVAL)
         try:
-            logger.info("🔍 [Сканер] Шукаю нові арбітражні ситуації...")
-            await process_opportunities_on_event(source="SCANNER")
+            logger.info("⏱ PnL report interval — updating positions...")
+            await update_positions(session)
+            summary = portfolio_summary()
+            await send_telegram(session, summary)
         except Exception as e:
-            logger.error(f"Помилка в автономному сканері: {e}")
-        await asyncio.sleep(900)
+            logger.error(f"PnL reporter error: {e}")
 
-async def main_loop():
-    logger.info("=== Запуск Polymarket AI Bot (MoneyPigBot) ===")
-    logger.info(f"Режим: {'SIMULATION (Arena)' if SIMULATION_MODE else 'LIVE TRADING'}")
-    
-    await init_db()
-    await load_processed_slugs()
-    await check_arena_portfolio()
-    await fetch_initial_whales()
-    
-    logger.info("📡 Запуск WebSocket слухача та Автономного сканера...")
-    
-    # Запускаємо автономний сканер як фонову задачу
-    asyncio.create_task(run_autonomous_scanner())
-    
-    # Запускаємо WebSockets listener (він блокує виконання)
-    await listen_to_whales_ws()
+# ─── Entry Point ─────────────────────────────────────────────────────────────
+async def main():
+    # Validate config
+    missing = []
+    if not TELEGRAM_API_ID:    missing.append("TELEGRAM_API_ID")
+    if not TELEGRAM_API_HASH:  missing.append("TELEGRAM_API_HASH")
+    if not SIGNAL_CHANNEL:     missing.append("SIGNAL_CHANNEL")
+
+    if missing:
+        logger.error(f"❌ Missing required environment variables: {', '.join(missing)}")
+        logger.error("Set them in your .env file and restart.")
+        return
+
+    logger.info("=" * 60)
+    logger.info("  Polymarket Copy-Trading Bot  [PAPER MODE]")
+    logger.info("=" * 60)
+    logger.info(f"  Virtual Balance : ${VIRTUAL_BALANCE:,.2f}")
+    logger.info(f"  Signal Channel  : {SIGNAL_CHANNEL}")
+    logger.info(f"  Report Interval : {PNL_REPORT_INTERVAL // 60} minutes")
+    logger.info("=" * 60)
+
+    # Create shared aiohttp session
+    async with aiohttp.ClientSession() as session:
+        # Send startup message
+        start_msg = (
+            f"🤖 <b>Polymarket Copy-Trading Bot Started</b>\n\n"
+            f"📡 Listening to: <code>{SIGNAL_CHANNEL}</code>\n"
+            f"💰 Virtual Balance: <b>${VIRTUAL_BALANCE:,.2f}</b>\n"
+            f"📊 Mode: <b>Paper Trading</b>\n\n"
+            f"Ready to copy whale trades on Polymarket! 🐋"
+        )
+        await send_telegram(session, start_msg)
+
+        # Start Telethon userbot
+        client = TelegramClient(
+            "copytrade_session",
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+        )
+
+        @client.on(events.NewMessage(chats=SIGNAL_CHANNEL))
+        async def _handler(event):
+            try:
+                await handle_signal(event, session)
+            except Exception as e:
+                logger.error(f"Handler error: {e}")
+
+        await client.start()
+        logger.info(f"✅ Telethon connected. Listening for signals on: {SIGNAL_CHANNEL}")
+
+        # Kick off background PnL reporter
+        asyncio.create_task(pnl_reporter(session))
+
+        # Run until disconnected
+        await client.run_until_disconnected()
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        logger.info("Бота зупинено користувачем.")
+    asyncio.run(main())
