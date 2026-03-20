@@ -21,6 +21,7 @@ import json
 import asyncio
 import logging
 import aiohttp
+import asyncpg
 from datetime import datetime, timezone
 from typing import Optional
 from dotenv import load_dotenv
@@ -44,6 +45,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 SIGNAL_CHANNEL    = os.getenv("SIGNAL_CHANNEL", "")      # e.g. @PolyBeatsEN or https://t.me/...
 VIRTUAL_BALANCE   = float(os.getenv("VIRTUAL_BALANCE", "10000"))
+DATABASE_URL      = os.getenv("DATABASE_URL")            # PostgreSQL connection string
 
 # Polymarket public API endpoints (no auth required)
 GAMMA_API   = "https://gamma-api.polymarket.com"
@@ -60,6 +62,114 @@ portfolio = {
     "total_pnl": 0.0,
 }
 _position_counter = 0
+
+# ─── Database ────────────────────────────────────────────────────────────────
+db_pool = None
+
+async def init_db():
+    """Connect to PostgreSQL and ensure tables exist."""
+    global db_pool, _position_counter
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL not set — bot will run in memory-only mode (data lost on restart).")
+        return
+
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        async with db_pool.acquire() as conn:
+            # Create trades table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS signals_trades (
+                    id SERIAL PRIMARY KEY,
+                    pos_id INT UNIQUE,
+                    market_slug VARCHAR(255),
+                    market_title TEXT,
+                    side VARCHAR(10),
+                    entry_price FLOAT,
+                    amount_usd FLOAT,
+                    shares FLOAT,
+                    token_id VARCHAR(255),
+                    status VARCHAR(20) DEFAULT 'OPEN',
+                    unrealized_pnl FLOAT DEFAULT 0.0,
+                    whale_wallet VARCHAR(255),
+                    opened_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TIMESTAMP WITH TIME ZONE
+                )
+            ''')
+            # Create state table for balance
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key VARCHAR(50) PRIMARY KEY,
+                    value TEXT
+                )
+            ''')
+            # Initialize balance in DB if not present
+            val = await conn.fetchval("SELECT value FROM bot_state WHERE key = 'balance_usd'")
+            if val is None:
+                await conn.execute("INSERT INTO bot_state (key, value) VALUES ('balance_usd', $1)", str(VIRTUAL_BALANCE))
+            else:
+                portfolio["balance_usd"] = float(val)
+
+            # Load open positions
+            rows = await conn.fetch("SELECT * FROM signals_trades WHERE status = 'OPEN'")
+            for row in rows:
+                pos_id = row['pos_id']
+                portfolio["positions"][pos_id] = {
+                    "id": pos_id,
+                    "market_slug": row['market_slug'],
+                    "market_title": row['market_title'],
+                    "side": row['side'],
+                    "entry_price": row['entry_price'],
+                    "entry_amount_usd": row['amount_usd'],
+                    "shares": row['shares'],
+                    "token_id": row['token_id'],
+                    "opened_at": row['opened_at'].isoformat(),
+                    "current_price": row['entry_price'],
+                    "unrealized_pnl": row['unrealized_pnl'],
+                    "whale_wallet": row['whale_wallet'],
+                }
+                _position_counter = max(_position_counter, pos_id)
+
+            # Load recent closed trades
+            closed_rows = await conn.fetch("SELECT * FROM signals_trades WHERE status = 'CLOSED' ORDER BY closed_at DESC LIMIT 20")
+            for row in closed_rows:
+                portfolio["closed_trades"].append({
+                    "market_title": row['market_title'],
+                    "side": row['side'],
+                    "realized_pnl": row['unrealized_pnl'], # at close time
+                })
+
+        logger.info(f"✅ Database initialized. Loaded {len(portfolio['positions'])} open positions.")
+    except Exception as e:
+        logger.error(f"❌ Database connection error: {e}")
+        db_pool = None
+
+async def save_trade_to_db(pos: dict):
+    if not db_pool: return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO signals_trades 
+                (pos_id, market_slug, market_title, side, entry_price, amount_usd, shares, token_id, whale_wallet, opened_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ''', pos['id'], pos['market_slug'], pos['market_title'], pos['side'], 
+                 pos['entry_price'], pos['entry_amount_usd'], pos['shares'], 
+                 pos['token_id'], pos['whale_wallet'], datetime.fromisoformat(pos['opened_at']))
+            
+            # Update balance
+            await conn.execute("UPDATE bot_state SET value = $1 WHERE key = 'balance_usd'", str(portfolio['balance_usd']))
+    except Exception as e:
+        logger.error(f"Error saving trade to DB: {e}")
+
+async def update_db_pnl():
+    if not db_pool: return
+    try:
+        async with db_pool.acquire() as conn:
+            for pos in portfolio["positions"].values():
+                await conn.execute('''
+                    UPDATE signals_trades SET unrealized_pnl = $1 WHERE pos_id = $2
+                ''', pos['unrealized_pnl'], pos['id'])
+    except Exception as e:
+        logger.error(f"Error updating PnL in DB: {e}")
 
 # ─── Telegram sender (via Bot API) ──────────────────────────────────────────
 async def send_telegram(session: aiohttp.ClientSession, text: str):
@@ -249,6 +359,10 @@ def open_position(market: dict, side: str, entry_price: float, amount_usd: float
     portfolio["balance_usd"] -= amount_usd
     logger.info(f"[PAPER] Opened position #{pos_id}: {side} on '{position['market_title']}' "
                 f"@ {entry_price:.3f} | ${amount_usd:.2f} | {shares:.2f} shares")
+    
+    # Persistent save
+    asyncio.create_task(save_trade_to_db(position))
+    
     return position
 
 async def update_positions(session: aiohttp.ClientSession):
@@ -262,6 +376,9 @@ async def update_positions(session: aiohttp.ClientSession):
             continue
         pos["current_price"] = price
         pos["unrealized_pnl"] = (price - pos["entry_price"]) * pos["shares"]
+    
+    # Sync unrealized PnL to DB
+    await update_db_pnl()
 
 def portfolio_summary() -> str:
     """Build a human-readable portfolio summary."""
@@ -407,6 +524,9 @@ async def main():
     logger.info(f"  Signal Channel  : {SIGNAL_CHANNEL}")
     logger.info(f"  Report Interval : {PNL_REPORT_INTERVAL // 60} minutes")
     logger.info("=" * 60)
+
+    # Initialize Database
+    await init_db()
 
     # Create shared aiohttp session
     async with aiohttp.ClientSession() as session:
